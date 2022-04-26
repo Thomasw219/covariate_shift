@@ -1,7 +1,10 @@
 import torch
 import numpy as np
 
-from toy_data import generate_toy_data
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+from toy_data import generate_toy_data, transformed_betas
 from kmmClassification import kmm
 
 def gaussian_kernel_gram_matrix(X, sigma=0.1, l=1):
@@ -15,7 +18,7 @@ def centralized_gram_matrix(X):
     n = X.shape[1]
     d = X.shape[0]
     gram_matrix = gaussian_kernel_gram_matrix(X)
-    center = torch.eye(n, device=X.device) - 1 / n * torch.ones(n, n)
+    center = torch.eye(n, device=X.device) - 1 / n * torch.ones(n, n, device=X.device)
     return center @ gram_matrix @ center
 
 def conditional_covariance_matrix(K_cy, K_cy2, K_cu, epsilon=0.01):
@@ -27,11 +30,19 @@ def conditional_covariance_matrix(K_cy, K_cy2, K_cu, epsilon=0.01):
 
 if __name__ == "__main__":
     n_samples = 10
-    all_data = []
+    all_full_dim_errors = []
+    all_errors = []
+    all_transformed_errors = []
+    all_test_losses = []
+    all_transformed_test_losses = []
     device = torch.device("cuda:0")
     for sample in range(n_samples):
-        data = []
-        for d in range(1, 21):
+        full_dim_errors = []
+        errors = []
+        transformed_errors = []
+        test_losses = []
+        transformed_test_losses = []
+        for d in range(1, 11):
             n = 500
             X_tr, y_tr, X_te, y_te, betas_true = generate_toy_data(d, n, n, device=device)
             K_cy = centralized_gram_matrix(y_tr)
@@ -40,8 +51,8 @@ if __name__ == "__main__":
 
             d_r = 1
             iterations = 500
-            eta = 0.5
-            W = torch.ones(d, d_r)
+            eta = 0.25
+            W = torch.ones(d, d_r, device=device)
             torch.nn.init.orthogonal_(W)
             for i in range(iterations):
                 W = W / torch.norm(W.flatten())
@@ -56,19 +67,41 @@ if __name__ == "__main__":
                 print(objective.item())
 
                 print(W.T)
+                if np.abs(np.abs(W[0, 0].item()) - 1) < 0.025:
+                    break
                 W.grad = None
                 objective.backward()
                 W = W.detach() - eta * W.grad
-                if np.abs(np.abs(W[0, 0]) - 1) < 0.025:
-                    break
+                if i % 100 == 0 and i != 0:
+                    W = torch.ones(d, d_r, device=device)
 
+            W = W.detach()
             W = W / torch.norm(W.flatten())
             U_tr = W.T @ X_tr
             U_te = W.T @ X_te
 
-            betas = torch.tensor(kmm(U_tr.cpu().numpy().T.astype(np.double), U_te.cpu().numpy().T.astype(np.double), 0.01))
-            data.append(torch.sum(torch.square(betas_true - betas)).item())
-        print(data)
-        all_data.append(data)
-    print(torch.tensor(all_data))
-    torch.save(all_data, "low_dim_errors.pt")
+            full_dim_betas = torch.tensor(kmm(X_tr.cpu().numpy().T.astype(np.double), X_te.cpu().numpy().T.astype(np.double), 0.01), device=device)
+            betas = torch.tensor(kmm(U_tr.cpu().numpy().T.astype(np.double), U_te.cpu().numpy().T.astype(np.double), 0.01), device=device)
+            betas_transformed_true = transformed_betas(W, U_tr, device=device)
+            full_dim_errors.append(torch.sum(torch.square(betas_true - full_dim_betas)).item())
+            errors.append(torch.sum(torch.square(betas_true - betas)).item())
+            transformed_errors.append(torch.sum(torch.square(betas_transformed_true - betas)).item())
+
+            model = LinearRegression()
+            model.fit(X_tr.T.cpu().numpy(), y_tr.flatten().cpu().numpy(), full_dim_betas.cpu().numpy())
+            y_te_hat = model.predict(X_te.T.cpu().numpy())
+            test_losses.append(mean_squared_error(y_te.flatten().cpu().numpy(), y_te_hat))
+            model.fit(U_tr.T.cpu().numpy(), y_tr.flatten().cpu().numpy(), betas.cpu().numpy())
+            y_te_hat = model.predict(U_te.T.cpu().numpy())
+            transformed_test_losses.append(mean_squared_error(y_te.flatten().cpu().numpy(), y_te_hat))
+        all_full_dim_errors.append(full_dim_errors)
+        all_errors.append(errors)
+        all_transformed_errors.append(transformed_errors)
+        all_test_losses.append(test_losses)
+        all_transformed_test_losses.append(transformed_test_losses)
+
+    torch.save(all_full_dim_errors, "full_dim_errors.pt")
+    torch.save(all_errors, "low_dim_errors.pt")
+    torch.save(all_transformed_errors, "low_dim_transformed_errors.pt")
+    torch.save(all_test_losses, "test_losses.pt")
+    torch.save(all_transformed_test_losses, "low_dim_test_losses.pt")
