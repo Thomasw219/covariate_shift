@@ -1,10 +1,14 @@
+from re import X
 import torch
 import numpy as np
+
+import matplotlib.pyplot as plt
+import torch.nn as nn
 
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 
-from toy_data import generate_toy_data, transformed_betas
+from toy_data import generate_toy_data, transformed_betas, generate_toy_data_nonlinear, transformed_betas_nonlinear, non_linear_data
 from kmmClassification import kmm
 
 def gaussian_kernel_gram_matrix(X, sigma=0.1, l=1):
@@ -28,7 +32,7 @@ def conditional_covariance_matrix(K_cy, K_cy2, K_cu, epsilon=0.01):
     outer = K_cy @ K_cu
     return K_cy2 - outer @ inner @ inner @ outer.T
 
-if __name__ == "__main__":
+def proof_of_concept_experiment():
     n_samples = 10
     all_full_dim_errors = []
     all_errors = []
@@ -105,3 +109,103 @@ if __name__ == "__main__":
     torch.save(all_transformed_errors, "low_dim_transformed_errors.pt")
     torch.save(all_test_losses, "test_losses.pt")
     torch.save(all_transformed_test_losses, "low_dim_test_losses.pt")
+
+def nonlinear_experiment():
+    d = 2
+    d_r = 1
+    iterations = 500
+    eta = 0.25
+    n = 400
+    device = torch.device("cuda:0")
+    X, y = non_linear_data(n, device)
+
+    plt.scatter(X.T[y == 1][:, 0].cpu(), X.T[y == 1][:, 1].cpu(), c='r')
+    plt.scatter(X.T[y == 0][:, 0].cpu(), X.T[y == 0][:, 1].cpu(), c='b')
+    plt.savefig("figures/nonlinear_2d.png")
+
+    y = y.reshape(1, n)
+#    torch.save(X, "data/X.pt")
+#    torch.save(y, "data/y.pt")
+
+    print(torch.sum(y == 1))
+    print(torch.sum(y == 0))
+
+    best_obj = torch.inf
+    best_W = None
+    for i in range(10):
+        W = torch.ones(d, d_r, device=device)
+        torch.nn.init.orthogonal_(W)
+
+        K_cy = centralized_gram_matrix(y)
+        identity = torch.eye(n, device=K_cy.device)
+        K_cy2 = (K_cy + 0.01 * identity) @ (K_cy + 0.01 * identity)
+
+        for i in range(iterations):
+            W = W / torch.norm(W.flatten())
+            check = W.T @ W
+            check[check < 1e-3] = 0
+            W = W.detach()
+            W.requires_grad = True
+
+            U_tr = W.T @ X
+            K_cu = centralized_gram_matrix(U_tr)
+            objective = torch.trace(conditional_covariance_matrix(K_cy, K_cy2, K_cu))
+            print(objective.item())
+
+            print(W.T)
+            if np.abs(np.abs(W[0, 0].item()) - 1) < 0.025:
+                break
+            W.grad = None
+            objective.backward()
+            W = W.detach() - eta * W.grad
+            if i % 100 == 0 and i != 0:
+                W = torch.ones(d, d_r, device=device)
+            print(objective.item())
+
+        W = W.detach()
+        W = W / torch.norm(W.flatten())
+        if objective < best_obj:
+            best_obj = objective
+            best_W = W
+    print(best_obj)
+    exit()
+#    print(best_W)
+#    torch.save(best_W, "data/best_W.pt")
+
+    best_obj = torch.inf
+    best_net = None
+    for i in range(10):
+        print("New net")
+        net = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        net.to(device)
+        optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+
+        K_cy = centralized_gram_matrix(y)
+        identity = torch.eye(n, device=K_cy.device)
+        K_cy2 = (K_cy + 0.01 * identity) @ (K_cy + 0.01 * identity)
+
+        for i in range(iterations):
+            U_tr = net.forward(X.T).T
+            K_cu = centralized_gram_matrix(U_tr)
+            objective = torch.trace(conditional_covariance_matrix(K_cy, K_cy2, K_cu))
+            print(objective.item())
+
+            optimizer.zero_grad()
+            objective.backward()
+            optimizer.step()
+
+        if objective < best_obj:
+            best_obj = objective
+            best_net = net
+    print(best_obj)
+    print(best_net)
+    torch.save(best_net, "data/best_net.pt")
+
+if __name__ == "__main__":
+    nonlinear_experiment()
